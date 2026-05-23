@@ -1,61 +1,33 @@
-# syntax=docker/dockerfile:1.7
+FROM python:3.13.12-slim@sha256:f1927c75e81efd1e091dbd64b6c0ecaa5630b38635a3d1c04034ac636e1f94c8
 
-FROM python:3.13.12-slim@sha256:f1927c75e81efd1e091dbd64b6c0ecaa5630b38635a3d1c04034ac636e1f94c8 AS builder
+ENV PYTHONUNBUFFERED=1 \
+    OTEL_SERVICE_NAME=retriever-minimal \
+    OTEL_EXPORTER_OTLP_ENDPOINT=http://otel-collector:4317 \
+    OTEL_LOG_LEVEL=INFO \
+    PORT=8001
 
-ENV PYTHONDONTWRITEBYTECODE=1 \
-    PYTHONUNBUFFERED=1 \
-    PIP_DISABLE_PIP_VERSION_CHECK=1 \
-    PIP_NO_CACHE_DIR=1 \
-    PIP_DEFAULT_TIMEOUT=120 \
-    PYTHONHASHSEED=0
-
-WORKDIR /build
+RUN mkdir -p /app \
+ && groupadd -g 1000 appgroup \
+ && useradd -m -u 1000 -g appgroup -s /bin/sh appuser \
+ && chown -R appuser:appgroup /app
 
 RUN apt-get update \
-    && apt-get install -y --no-install-recommends build-essential ca-certificates \
-    && rm -rf /var/lib/apt/lists/*
+ && apt-get install -y --no-install-recommends ca-certificates curl \
+ && rm -rf /var/lib/apt/lists/*
 
-COPY requirements.txt ./
-
-RUN python -m pip install --upgrade pip setuptools wheel \
-    && pip wheel --wheel-dir /wheels -r requirements.txt
-
-
-FROM python:3.13.12-slim@sha256:f1927c75e81efd1e091dbd64b6c0ecaa5630b38635a3d1c04034ac636e1f94c8 AS runtime
-
-ENV PYTHONDONTWRITEBYTECODE=1 \
-    PYTHONUNBUFFERED=1 \
-    PIP_DISABLE_PIP_VERSION_CHECK=1 \
-    PIP_NO_CACHE_DIR=1 \
-    PYTHONPATH=/app \
-    PYTHONHASHSEED=0 \
-    PORT=8001 \
-    UVICORN_LOOP=uvloop \
-    UVICORN_HTTP=httptools
+RUN python -m pip install --upgrade pip
 
 WORKDIR /app
+COPY requirements.txt .
+RUN python -m pip install --no-cache-dir -r requirements.txt
 
-RUN addgroup --system app \
-    && adduser --system --ingroup app --home /app app \
-    && apt-get update \
-    && apt-get upgrade -y \
-    && apt-get install -y --no-install-recommends ca-certificates \
-    && rm -rf /var/lib/apt/lists/*
+COPY main.py telemetry.py store.py /app/
+RUN chown -R appuser:appgroup /app
 
-COPY --from=builder /wheels /wheels
-COPY requirements.txt ./
-
-RUN python -m pip install --no-index --find-links=/wheels -r requirements.txt \
-    && rm -rf /wheels
-
-COPY . ./
-
-RUN chown -R app:app /app
-
-USER app
-
+USER appuser
 EXPOSE 8001
 
-HEALTHCHECK --interval=30s --timeout=3s --start-period=30s --retries=3 CMD ["python","-c","import urllib.request; urllib.request.urlopen('http://127.0.0.1:8001/readyz', timeout=2).read()"]
+HEALTHCHECK --interval=15s --timeout=5s --start-period=10s --retries=3 \
+  CMD curl --fail --silent http://127.0.0.1:8001/healthz || exit 1
 
-CMD ["python","-m","uvicorn","main:app","--host","0.0.0.0","--port","8001","--loop","uvloop","--http","httptools","--proxy-headers","--forwarded-allow-ips","*","--workers","1"]
+CMD ["python", "-u", "/app/main.py"]
