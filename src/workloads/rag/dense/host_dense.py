@@ -1,17 +1,11 @@
-"""Dense embedding service with OpenTelemetry (traces, metrics, logs).
+"""
+Dense embedding service — leaf service, logs only.
 
-OTel providers are initialized inside the startup event (after uvicorn
-configures its logging). Traces are created only when tracer is
-available; metrics use a no-op fallback.
+Generates embeddings using fastembed. No traces, no custom metrics.
+Its latency and error rate are captured by retriever-minimal's
+CLIENT span ("dense /embed").
 
-TRACE CONTEXT PROPAGATION
--------------------------
-Incoming traceparent / tracestate headers are explicitly extracted from
-the FastAPI Request object and passed to the tracer.  This ensures that
-the span created here becomes a *child* of whatever upstream service
-(retriever-minimal, frontend, …) called us.  Without this extraction
-the OTel SDK would see no parent context and create a new root span,
-breaking the distributed trace.
+Logs are bridged to OpenTelemetry at module import time.
 """
 
 from __future__ import annotations
@@ -27,35 +21,22 @@ from pathlib import Path
 from typing import Any
 
 import numpy as np
-from fastapi import FastAPI, HTTPException, Request
-from fastembed import TextEmbedding
+from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
 
-# ─── Configuration ─────────────────────────────────────────────────
-# Normalise LOG_LEVEL so it is always a valid Python logging level name
-_RAW_LEVEL = os.getenv("OTEL_LOG_LEVEL", os.getenv("LOG_LEVEL", "INFO")).upper()
-_LEVEL_MAP = {"WARN": "WARNING", "EXCEPTION": "ERROR"}
-LOG_LEVEL = _LEVEL_MAP.get(_RAW_LEVEL, _RAW_LEVEL)
-if LOG_LEVEL not in {"DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"}:
-    LOG_LEVEL = "INFO"
-
-# Uvicorn expects lowercase, Python logging expects uppercase
-LOG_LEVEL_NAME = LOG_LEVEL.upper()      # e.g. WARNING
-UVICORN_LOG_LEVEL = LOG_LEVEL.lower()   # e.g. warning
-
+# ─── Logging ──────────────────────────────────────────────────────
+LOG_LEVEL: str = os.getenv("LOG_LEVEL", "INFO").upper()
 logging.basicConfig(
-    level=getattr(logging, LOG_LEVEL_NAME, logging.INFO),
+    level=getattr(logging, LOG_LEVEL, logging.INFO),
     format="%(asctime)s [%(name)s] %(levelname)s %(message)s",
     stream=sys.stderr,
 )
 log = logging.getLogger("dense-embedder")
-
-# ── Silence noisy loggers ─────────────────────────────────────────
 logging.getLogger("uvicorn.access").setLevel(logging.WARNING)
-logging.getLogger("httpx").setLevel(logging.WARNING)
-logging.getLogger("httpcore").setLevel(logging.WARNING)
+logging.getLogger("uvicorn").setLevel(logging.WARNING)
 logging.getLogger("filelock").setLevel(logging.WARNING)
 
+# ─── Configuration ────────────────────────────────────────────────
 DENSE_MODEL_NAME: str = os.getenv("DENSE_MODEL_NAME", "BAAI/bge-small-en-v1.5")
 LOCAL_DENSE_MODEL_PATH: str | None = os.getenv("LOCAL_DENSE_MODEL_PATH") or (
     Path("/app/.resolved_model_path").read_text().strip()
@@ -66,125 +47,41 @@ DENSE_DIM: int = int(os.getenv("DENSE_DIM", "384"))
 DENSE_BATCH_SIZE: int = int(os.getenv("DENSE_BATCH_SIZE", "32"))
 DENSE_NORMALIZE: bool = os.getenv("DENSE_NORMALIZE", "TRUE").upper() in ("1", "TRUE", "YES")
 DENSE_CUDA: bool = os.getenv("DENSE_CUDA", "0").upper() in ("1", "TRUE", "YES")
-PRELOAD_MODEL: bool = os.getenv("PRELOAD_MODEL", "0").upper() in ("1", "TRUE", "YES")
-
-OTEL_SERVICE_NAME: str = os.getenv("OTEL_SERVICE_NAME", "dense-embedder")
-OTEL_EXPORTER_ENDPOINT: str = os.getenv("OTEL_EXPORTER_OTLP_ENDPOINT", "http://otel-collector:4317")
-OTEL_EXPORTER_INSECURE: bool = os.getenv("OTEL_EXPORTER_OTLP_INSECURE", "true").lower() == "true"
-OTEL_METRIC_INTERVAL_MS: int = int(os.getenv("OTEL_METRIC_EXPORT_INTERVAL_MS", "60000"))
-OTEL_METRIC_TIMEOUT_MS: int = int(os.getenv("OTEL_METRIC_EXPORT_TIMEOUT_MS", "30000"))
-DEPLOYMENT_ENV: str = os.getenv("DEPLOYMENT_ENVIRONMENT", os.getenv("ENV", "production"))
-SERVICE_VERSION: str = os.getenv("SERVICE_VERSION", "0.1.0")
+PRELOAD_MODEL: bool = os.getenv("PRELOAD_MODEL", "1").upper() in ("1", "TRUE", "YES")
 
 # ═══════════════════════════════════════════════════════════════════
-# Global OTel handles — populated at startup
+# OpenTelemetry — Logs only (module import time, before uvicorn)
 # ═══════════════════════════════════════════════════════════════════
+from opentelemetry import _logs
+from opentelemetry.exporter.otlp.proto.grpc._log_exporter import OTLPLogExporter
+from opentelemetry.instrumentation.logging import LoggingInstrumentor
+from opentelemetry.sdk._logs import LoggerProvider, LoggingHandler
+from opentelemetry.sdk._logs.export import BatchLogRecordProcessor
+from opentelemetry.sdk.resources import Resource
 
-_tracer_provider: Any = None
-_meter_provider: Any = None
-_logger_provider: Any = None
-tracer: Any = None
-meter: Any = None
-request_counter: Any = None
-request_duration: Any = None
-requests_in_progress: Any = None
-error_counter: Any = None
+_otel_endpoint = os.getenv("OTEL_EXPORTER_OTLP_ENDPOINT", "http://otel-collector:4317")
+_service_name = os.getenv("OTEL_SERVICE_NAME", "dense-embedder")
 
+_resource = Resource.create({
+    "service.name": _service_name,
+    "service.version": os.getenv("SERVICE_VERSION", "0.1.0"),
+    "deployment.environment": os.getenv("DEPLOYMENT_ENVIRONMENT", "production"),
+})
 
-class _NoOpMetric:
-    """Fallback for metrics when OTel is unavailable."""
-    def add(self, *args: Any, **kwargs: Any) -> None: pass
-    def record(self, *args: Any, **kwargs: Any) -> None: pass
+_logger_provider = LoggerProvider(resource=_resource)
+_logger_provider.add_log_record_processor(
+    BatchLogRecordProcessor(OTLPLogExporter(endpoint=_otel_endpoint, insecure=True))
+)
+_logs.set_logger_provider(_logger_provider)
 
+logging.getLogger().addHandler(
+    LoggingHandler(level=logging.NOTSET, logger_provider=_logger_provider)
+)
+LoggingInstrumentor().instrument(set_logging_format=False)
+log.info("OTel logs initialised — endpoint=%s", _otel_endpoint)
 
-def _init_otel() -> None:
-    """Create OTel providers and attach log handler. Called in startup event."""
-    global _tracer_provider, _meter_provider, _logger_provider
-    global tracer, meter, request_counter, request_duration, requests_in_progress, error_counter
-
-    from opentelemetry import _logs, metrics, trace
-    from opentelemetry.exporter.otlp.proto.grpc._log_exporter import OTLPLogExporter
-    from opentelemetry.exporter.otlp.proto.grpc.metric_exporter import OTLPMetricExporter
-    from opentelemetry.exporter.otlp.proto.grpc.trace_exporter import OTLPSpanExporter
-    from opentelemetry.instrumentation.logging.handler import LoggingHandler
-    from opentelemetry.instrumentation.logging import LoggingInstrumentor
-    from opentelemetry.sdk._logs import LoggerProvider
-    from opentelemetry.sdk._logs.export import BatchLogRecordProcessor
-    from opentelemetry.sdk.metrics import MeterProvider
-    from opentelemetry.sdk.metrics.export import PeriodicExportingMetricReader
-    from opentelemetry.sdk.resources import Resource
-    from opentelemetry.sdk.trace import TracerProvider
-    from opentelemetry.sdk.trace.export import BatchSpanProcessor
-
-    resource = Resource.create({
-        "service.name": OTEL_SERVICE_NAME,
-        "service.version": SERVICE_VERSION,
-        "deployment.environment": DEPLOYMENT_ENV,
-    })
-
-    # Traces
-    try:
-        _tracer_provider = TracerProvider(resource=resource)
-        _tracer_provider.add_span_processor(
-            BatchSpanProcessor(
-                OTLPSpanExporter(endpoint=OTEL_EXPORTER_ENDPOINT, insecure=OTEL_EXPORTER_INSECURE),
-            )
-        )
-        trace.set_tracer_provider(_tracer_provider)
-        tracer = trace.get_tracer(__name__)
-        log.info("Traces initialized")
-    except Exception:
-        log.exception("Traces initialization failed")
-        tracer = None
-
-    # Metrics
-    try:
-        _meter_provider = MeterProvider(
-            resource=resource,
-            metric_readers=[
-                PeriodicExportingMetricReader(
-                    OTLPMetricExporter(endpoint=OTEL_EXPORTER_ENDPOINT, insecure=OTEL_EXPORTER_INSECURE),
-                    export_interval_millis=OTEL_METRIC_INTERVAL_MS,
-                    export_timeout_millis=OTEL_METRIC_TIMEOUT_MS,
-                )
-            ],
-        )
-        metrics.set_meter_provider(_meter_provider)
-        meter = metrics.get_meter(__name__)
-        request_counter = meter.create_counter("dense.requests", "1", "Total embed requests")
-        request_duration = meter.create_histogram("dense.request_duration", "s", "Embed request latency")
-        requests_in_progress = meter.create_up_down_counter("dense.requests_in_progress", "1", "In-flight requests")
-        error_counter = meter.create_counter("dense.errors", "1", "Total embed errors")
-        log.info("Metrics initialized")
-    except Exception:
-        log.exception("Metrics initialization failed")
-        meter = None
-        noop = _NoOpMetric()
-        request_counter = request_duration = requests_in_progress = error_counter = noop
-
-    # Logs — LoggingHandler + LoggingInstrumentor keeps it alive across uvicorn restarts
-    try:
-        _logger_provider = LoggerProvider(resource=resource)
-        _logger_provider.add_log_record_processor(
-            BatchLogRecordProcessor(
-                OTLPLogExporter(endpoint=OTEL_EXPORTER_ENDPOINT, insecure=OTEL_EXPORTER_INSECURE),
-            )
-        )
-        _logs.set_logger_provider(_logger_provider)
-        handler = LoggingHandler(level=logging.NOTSET, logger_provider=_logger_provider)
-        logging.getLogger().setLevel(logging.NOTSET)
-        logging.getLogger().addHandler(handler)
-        LoggingInstrumentor().instrument(set_logging_format=False)
-        log.info("Logs initialized")
-    except Exception:
-        log.exception("Logs initialization failed")
-
-
-# ═══════════════════════════════════════════════════════════════════
-# FastAPI App
-# ═══════════════════════════════════════════════════════════════════
-
-app = FastAPI(title="dense-embedder", version=SERVICE_VERSION, docs_url=None, redoc_url=None)
+# ─── FastAPI ──────────────────────────────────────────────────────
+app = FastAPI(title="dense-embedder", version="0.1.0", docs_url=None, redoc_url=None)
 
 _MAX_WORKERS: int = max(1, (os.cpu_count() or 4) // 2)
 _EMBED_EXECUTOR = ThreadPoolExecutor(max_workers=_MAX_WORKERS)
@@ -199,7 +96,7 @@ class EmbedResponse(BaseModel):
 
 
 _MODEL_LOCK = threading.Lock()
-_MODEL: TextEmbedding | None = None
+_MODEL: Any = None
 _MODEL_ERROR: str | None = None
 _READY_AT: float | None = None
 
@@ -228,12 +125,10 @@ def _load_model() -> None:
         source = _resolve_model_source()
         log.info("Loading model source=%s cuda=%s", source, DENSE_CUDA)
         try:
-            kwargs = {"model_name": source}
+            from fastembed import TextEmbedding
+            kwargs: dict[str, Any] = {"model_name": source}
             if DENSE_CUDA:
-                try:
-                    kwargs["providers"] = ["CUDAExecutionProvider"]
-                except TypeError:
-                    pass
+                kwargs["providers"] = ["CUDAExecutionProvider"]
             _MODEL = TextEmbedding(**kwargs)
             _ = list(_MODEL.embed(["_warmup_"]))
             _READY_AT = time.time()
@@ -266,86 +161,41 @@ def _embed_sync(texts: list[str]) -> list[list[float]]:
 # ═══════════════════════════════════════════════════════════════════
 
 @app.post("/embed", response_model=EmbedResponse)
-async def embed(req: EmbedRequest, request: Request) -> dict[str, Any]:
-    """
-    Generate dense embeddings for input texts.
-
-    TRACE CONTEXT PROPAGATION
-    -------------------------
-    The incoming HTTP request may carry W3C trace context headers
-    (traceparent, tracestate) injected by an upstream service
-    (e.g. retriever-minimal).  We explicitly extract that context here
-    and pass it to the tracer so that the span created in this
-    endpoint becomes a **child** of the upstream span rather than a
-    new root.  This is how a single distributed trace links both
-    services together in SigNoz / Jaeger.
-
-    IMPORTANT: FastAPIInstrumentor (registered in the startup event)
-    also reads traceparent automatically and creates a SERVER span.
-    The explicit extraction below ensures that our *manual* span
-    ("POST /embed") is nested under that SERVER span, preserving the
-    full parent → child → grandchild relationship.
-    """
-    # ── Extract trace context from upstream caller ────────────────
-    from opentelemetry.propagate import extract
-
-    ctx = extract(dict(request.headers))
-
+async def embed(req: EmbedRequest) -> dict[str, Any]:
     if not req.texts:
         raise HTTPException(400, "'texts' must be a non-empty list")
     if len(req.texts) > DENSE_BATCH_SIZE:
         raise HTTPException(400, f"Batch exceeds max ({DENSE_BATCH_SIZE})")
 
-    labels = {"model": DENSE_MODEL_NAME, "cuda": str(DENSE_CUDA).lower()}
-    requests_in_progress.add(1, labels)
+    log.info("Embed started batch_size=%d", len(req.texts))
     start = time.perf_counter()
-    status = "success"
-
-    async def _run() -> list[list[float]]:
-        return await asyncio.get_running_loop().run_in_executor(
-            _EMBED_EXECUTOR, _embed_sync, req.texts
-        )
 
     try:
-        if tracer is not None:
-            # Use the extracted context so this span links to the parent
-            with tracer.start_as_current_span("POST /embed", context=ctx) as span:
-                span.set_attributes({
-                    "batch.size": len(req.texts),
-                    "model.name": DENSE_MODEL_NAME,
-                })
-                vectors = await _run()
-                span.set_attribute("vectors.count", len(vectors))
-        else:
-            vectors = await _run()
-
-        log.info("Embed completed count=%d", len(vectors))
+        vectors = await asyncio.get_running_loop().run_in_executor(
+            _EMBED_EXECUTOR, _embed_sync, req.texts
+        )
+        elapsed = time.perf_counter() - start
+        log.info("Embed completed count=%d elapsed=%.3fs", len(vectors), elapsed)
         return {"vectors": vectors}
     except HTTPException:
-        status = "client_error"
         raise
     except RuntimeError as exc:
-        status = "model_error"
-        error_counter.add(1, {**labels, "error_type": "runtime"})
         log.error("Model error: %s", exc)
         raise HTTPException(503, str(exc))
     except Exception:
-        status = "server_error"
-        error_counter.add(1, {**labels, "error_type": "exception"})
         log.exception("Embed failed")
         raise HTTPException(500, "Internal server error")
-    finally:
-        elapsed = time.perf_counter() - start
-        request_counter.add(1, {**labels, "status": status})
-        request_duration.record(elapsed, labels)
-        requests_in_progress.add(-1, labels)
 
 
 @app.get("/health")
 def health() -> dict[str, Any]:
     return {
-        "status": "ok", "model": DENSE_MODEL_NAME, "dim": DENSE_DIM,
-        "normalize": DENSE_NORMALIZE, "cuda": DENSE_CUDA, "model_error": _MODEL_ERROR,
+        "status": "ok",
+        "model": DENSE_MODEL_NAME,
+        "dim": DENSE_DIM,
+        "normalize": DENSE_NORMALIZE,
+        "cuda": DENSE_CUDA,
+        "model_error": _MODEL_ERROR,
     }
 
 
@@ -366,13 +216,12 @@ def healthz() -> dict[str, str]:
     return {"status": "ok"}
 
 
+# ═══════════════════════════════════════════════════════════════════
+# Startup / Shutdown
+# ═══════════════════════════════════════════════════════════════════
+
 @app.on_event("startup")
 async def on_startup() -> None:
-    _init_otel()
-
-    from opentelemetry.instrumentation.fastapi import FastAPIInstrumentor
-    FastAPIInstrumentor.instrument_app(app, tracer_provider=_tracer_provider)
-
     log.info("Starting dense-embedder model=%s dim=%d workers=%d",
              DENSE_MODEL_NAME, DENSE_DIM, _MAX_WORKERS)
     if PRELOAD_MODEL:
@@ -384,26 +233,26 @@ async def on_startup() -> None:
 
 @app.on_event("shutdown")
 async def on_shutdown() -> None:
-    log.info("Shutting down — flushing telemetry")
+    log.info("Shutting down — flushing logs")
     _EMBED_EXECUTOR.shutdown(wait=True)
-    for name, p in [("traces", _tracer_provider), ("metrics", _meter_provider), ("logs", _logger_provider)]:
-        if p is None:
-            continue
+    if _logger_provider:
         try:
-            if hasattr(p, "force_flush"):
-                p.force_flush(timeout_millis=10_000)
-            p.shutdown()
+            _logger_provider.force_flush(timeout_millis=10_000)
+            _logger_provider.shutdown()
         except Exception:
-            log.exception("Shutdown error: %s", name)
+            pass
 
 
+# ═══════════════════════════════════════════════════════════════════
+# Entrypoint
+# ═══════════════════════════════════════════════════════════════════
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run(
         "host_dense:app",
         host=os.getenv("DENSE_HOST", "0.0.0.0"),
         port=int(os.getenv("DENSE_PORT", "8200")),
-        log_level=UVICORN_LOG_LEVEL,
+        log_level=LOG_LEVEL.lower(),
         log_config=None,
         loop="uvloop",
         http="httptools",
