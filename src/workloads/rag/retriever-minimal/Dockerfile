@@ -34,7 +34,7 @@ COPY requirements.txt .
 RUN python -m pip install --no-cache-dir -r requirements.txt
 
 # ─── Application code ──────────────────────────────────────────────
-COPY main.py telemetry.py store.py /app/
+COPY main.py store.py /app/
 RUN chown -R appuser:appgroup /app
 
 # ─── Runtime ───────────────────────────────────────────────────────

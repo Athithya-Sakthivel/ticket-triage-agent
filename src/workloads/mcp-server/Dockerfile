@@ -1,7 +1,7 @@
 # =============================================================================
 # MCP Server — Production Docker Image (Single-Stage)
 # =============================================================================
-FROM python:3.13.3-slim@sha256:a65e8dd5a6184bd7ab5c2285dce593ed4fbf8204aa975b1ed3f5e18d7d11bc07
+FROM python:3.13.12-slim@sha256:f1927c75e81efd1e091dbd64b6c0ecaa5630b38635a3d1c04034ac636e1f94c8
 
 ENV PYTHONUNBUFFERED=1 \
     PYTHONDONTWRITEBYTECODE=1 \
