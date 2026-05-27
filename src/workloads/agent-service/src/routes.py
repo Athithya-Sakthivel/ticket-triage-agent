@@ -13,10 +13,9 @@ from pydantic import BaseModel
 from sqlalchemy import select, func
 
 from db import AsyncSessionLocal, HumanOverride, Ticket
-from state import AgentState
+from state import AgentState, Context
 
 log = logging.getLogger("agent-service")
-
 router = APIRouter()
 
 
@@ -35,15 +34,21 @@ class OverrideRequest(BaseModel):
 
 @router.websocket("/ws/chat/{session_id}")
 async def websocket_chat(websocket: WebSocket, session_id: str):
-    """Real-time chat endpoint."""
     await websocket.accept()
 
     app = websocket.app
     graph = app.state.graph
-    mcp_client = app.state.mcp_client
-    triage_program = app.state.triage_program   # DSPy program for guardrail
+    triage_program = app.state.triage_program
     resolver_lm = app.state.resolver_lm
+    mcp_client = app.state.mcp_client
     tracer = app.state.tracer
+
+    ctx = Context(
+        triage_program=triage_program,
+        mcp_client=mcp_client,
+        resolver_lm=resolver_lm,
+        tracer=tracer,
+    )
 
     try:
         while True:
@@ -63,7 +68,6 @@ async def websocket_chat(websocket: WebSocket, session_id: str):
                 "guardrail_rejected": False,
                 "classification": None,
                 "customer_context": None,
-                "policy_chunks": [],
                 "tool_results": [],
                 "resolution_type": None,
                 "ticket_id": None,
@@ -72,15 +76,7 @@ async def websocket_chat(websocket: WebSocket, session_id: str):
             }
 
             config = {"configurable": {"thread_id": session_id}}
-
-            result = await graph.ainvoke(
-                state,
-                config,
-                triage_program=triage_program,
-                resolver_lm=resolver_lm,
-                mcp_client=mcp_client,
-                tracer=tracer,
-            )
+            result = await graph.ainvoke(state, config, context=ctx)
 
             await websocket.send_json({
                 "response": result.get("final_response", ""),

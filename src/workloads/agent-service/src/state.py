@@ -1,45 +1,55 @@
 """
-AgentState TypedDict for LangGraph.
-
-Uses MessagesState as the base so message history is automatically
-appended via the add_messages reducer.  Additional fields carry
-business context through the graph.
+AgentState TypedDict, Context dataclass, and routing conditions.
 """
 
 from __future__ import annotations
 
-import uuid
-from typing import Annotated, Any, NotRequired, TypedDict
+from dataclasses import dataclass
+from typing import Any
 
 from langgraph.graph import MessagesState
-from langgraph.graph.message import add_messages
+
+from config import settings
 
 
 class AgentState(MessagesState):
-    """Full agent state flowing through every node.
+    """Full agent state flowing through every node."""
 
-    Inherits from MessagesState, which provides:
-      - messages: list[AnyMessage] with add_messages reducer
-    """
-
-    # ── Input ─────────────────────────────────────────────────────
     user_id: str | None
     query_text: str
-    thread_id: str  # idempotency key for LangGraph checkpointing
+    thread_id: str
 
-    # ── Guardrail + Classification ─────────────────────────────────
     guardrail_rejected: bool
-    classification: dict[str, Any] | None  # {intent, urgency, sentiment, auto_resolvable}
+    classification: dict[str, Any] | None
 
-    # ── Context ────────────────────────────────────────────────────
-    customer_context: dict[str, Any] | None  # customer profile + orders
+    customer_context: dict[str, Any] | None
 
-    # ── Resolution ─────────────────────────────────────────────────
-    policy_chunks: list[dict[str, Any]]
-    tool_results: list[dict[str, Any]]  # raw MCP tool call results
-    resolution_type: str | None  # "auto_resolved" | "escalated" | "deflected"
+    tool_results: list[dict[str, Any]]
+    resolution_type: str | None
     ticket_id: str | None
 
-    # ── Output ─────────────────────────────────────────────────────
     final_response: str | None
     error: str | None
+
+
+@dataclass
+class Context:
+    """Runtime dependencies injected via graph.ainvoke(..., context=Context(...))."""
+    triage_program: Any
+    mcp_client: Any
+    resolver_lm: Any
+    tracer: Any
+
+
+def route_after_guardrail(state: AgentState) -> str:
+    if state.get("guardrail_rejected", False):
+        return "human_escalate"
+
+    classification = state.get("classification", {})
+    if classification.get("urgency", 0) >= settings.urgency_escalate_threshold:
+        return "human_escalate"
+
+    if not classification.get("auto_resolvable", True):
+        return "human_escalate"
+
+    return "context_gatherer"

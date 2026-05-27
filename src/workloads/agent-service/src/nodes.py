@@ -1,7 +1,8 @@
 """
 LangGraph node implementations – production ready.
-Each node records metrics via observability.metrics_.
-LLM calls use async methods or run in executors to avoid blocking.
+
+All nodes receive runtime dependencies via Runtime[Context] (LangGraph v1.2+).
+Metrics are recorded for every node via the _record_node helper.
 """
 
 from __future__ import annotations
@@ -14,17 +15,16 @@ import time
 from contextlib import nullcontext
 from typing import Any
 
+from langgraph.runtime import Runtime
+
 from config import settings
-from state import AgentState
+from state import AgentState, Context
 import observability
 
 log = logging.getLogger("agent-service")
 
-# ---------------------------------------------------------------------------
-# Metrics helper
-# ---------------------------------------------------------------------------
+
 async def _record_node(node_name: str, coro):
-    """Wrap a coroutine to record requests, duration, and errors."""
     labels = {"node": node_name}
     start = time.perf_counter()
     observability.metrics_.request_counter.add(1, {**labels, "status": "started"})
@@ -45,14 +45,16 @@ async def _record_node(node_name: str, coro):
 
 
 # ═══════════════════════════════════════════════════════════════════
-# 1. GUARDRAIL + CLASSIFIER (uses DSPy TriageProgram)
+# 1. GUARDRAIL + CLASSIFIER
 # ═══════════════════════════════════════════════════════════════════
 async def guardrail_classifier(
     state: AgentState,
-    triage_program: Any,   # compiled DSPy TriageProgram
-    tracer: Any = None,
+    runtime: Runtime[Context],
 ) -> dict[str, Any]:
-    """Safety check + ticket classification via DSPy."""
+    """Safety check + ticket classification via DSPy TriageProgram."""
+
+    triage_program = runtime.context.triage_program
+    tracer = runtime.context.tracer
 
     async def _run():
         query = state["query_text"].strip()
@@ -67,7 +69,6 @@ async def guardrail_classifier(
             if span:
                 span.set_attribute("openinference.span.kind", "GUARDRAIL")
 
-            # DSPy program is sync; run in thread to avoid blocking
             result = await asyncio.get_event_loop().run_in_executor(
                 None, triage_program, query
             )
@@ -95,14 +96,16 @@ async def guardrail_classifier(
 
 
 # ═══════════════════════════════════════════════════════════════════
-# 2. CONTEXT GATHERER (no LLM)
+# 2. CONTEXT GATHERER
 # ═══════════════════════════════════════════════════════════════════
 async def context_gatherer(
     state: AgentState,
-    mcp_client: Any,
-    tracer: Any = None,
+    runtime: Runtime[Context],
 ) -> dict[str, Any]:
     """Fetch customer profile and recent orders via MCP tools in parallel."""
+
+    mcp_client = runtime.context.mcp_client
+    tracer = runtime.context.tracer
 
     async def _run():
         query = state["query_text"]
@@ -111,22 +114,22 @@ async def context_gatherer(
         user_id = state.get("user_id")
 
         if not email and not user_id:
-            log.warning("No customer identifier — skipping context")
+            log.warning("No customer identifier – skipping context")
             return {"customer_context": None}
 
         with (tracer.start_as_current_span("context_gatherer") if tracer else nullcontext()) as span:
             if span:
                 span.set_attribute("openinference.span.kind", "CHAIN")
 
-            customer_task = mcp_client.call_tool("lookup_customer", {"email": email}) if email else None
-            orders_task = mcp_client.call_tool("get_recent_orders", {"user_id": user_id}) if user_id else None
-
-            customer = await customer_task if customer_task else None
+            customer = None
+            if email:
+                customer = await mcp_client.call_tool("lookup_customer", {"email": email})
             if customer and customer.get("id"):
                 user_id = customer["id"]
+
+            orders = []
+            if user_id:
                 orders = await mcp_client.call_tool("get_recent_orders", {"user_id": user_id})
-            else:
-                orders = []
 
             customer_context = {"customer": customer, "orders": orders}
             if span:
@@ -139,22 +142,26 @@ async def context_gatherer(
 
 
 # ═══════════════════════════════════════════════════════════════════
-# 3. AGENTIC RESOLVER (LLM #2 — async)
+# 3. AGENTIC RESOLVER
 # ═══════════════════════════════════════════════════════════════════
 RESOLVER_SYSTEM_PROMPT = """You are a helpful, empathetic customer service agent for Kestral, an Indian e-commerce company.
 
 You have access to these tools:
 - search_policies(query) — search company policies (returns, refunds, delivery, warranty)
 - check_refund_eligibility(order_id) — check if an order can be refunded
-- process_auto_refund(order_id) — process an automatic refund (use only when eligible)
+- issue_wallet_credit(user_id, amount, reason) — issue store credit (max Rs.500)
+- schedule_return_pickup(order_id, pickup_date) — schedule a return pickup
+- create_ticket(user_id, query_text, classification, priority, assigned_team) — create a support ticket
+- escalate_to_human(ticket_id) — escalate a ticket to a human agent
+- route_to_team(ticket_id, team) — assign a ticket to a specific team
 
 Rules:
-1. Gather information step by step. Don't jump to conclusions.
+1. Gather information step by step. Never jump to conclusions.
 2. Always ground your responses in retrieved policy documents.
-3. If a refund is eligible and the amount is under Rs. 10,000, process it automatically.
-4. If the issue is complex, urgent (urgency >= 8), or the amount exceeds Rs. 10,000, suggest creating a ticket for human review instead of auto-resolving.
-5. Use the customer's name when available.
-6. Include specific timelines and amounts from policies.
+3. Only use issue_wallet_credit for policy-driven compensation (delays, goodwill) and never more than Rs.500.
+4. Only use schedule_return_pickup if the order is eligible for return.
+5. For high-value claims (>Rs.10,000) or security issues, do NOT resolve automatically – create a ticket and escalate.
+6. Use the customer's name when available. Include specific timelines and amounts from policies.
 7. Output your reasoning, then the tool call or final answer.
 
 Respond in JSON:
@@ -164,13 +171,16 @@ Respond in JSON:
 
 MAX_RESOLVER_STEPS = 5
 
+
 async def agentic_resolver(
     state: AgentState,
-    resolver_lm: Any,   # dspy.LM (async via acall)
-    mcp_client: Any,
-    tracer: Any = None,
+    runtime: Runtime[Context],
 ) -> dict[str, Any]:
     """Agentic loop that resolves tickets by calling tools dynamically."""
+
+    resolver_lm = runtime.context.resolver_lm
+    mcp_client = runtime.context.mcp_client
+    tracer = runtime.context.tracer
 
     async def _run():
         query = state["query_text"]
@@ -222,30 +232,29 @@ Recent orders: {json.dumps(orders[:3]) if orders else 'None'}"""},
                             "tool_results": tool_results,
                         }
 
-                    # ── Tool call ────────────────────────────────
                     tool_name = result.get("tool")
                     tool_args = result.get("args", {})
 
-                    with (tracer.start_as_current_span(f"tool:{tool_name}") if tracer else nullcontext()) as tool_span:
-                        if tool_span:
-                            tool_span.set_attribute("openinference.span.kind", "TOOL")
-                            tool_span.set_attribute("tool.name", tool_name)
-
-                        try:
-                            tool_output = await mcp_client.call_tool(tool_name, tool_args)
-                            tool_results.append({"tool": tool_name, "args": tool_args, "result": tool_output})
+                    if tool_name == "issue_wallet_credit" and tool_args.get("amount", 0) > settings.max_wallet_credit_amount:
+                        tool_output = {"status": "rejected", "reason": f"Amount exceeds maximum of Rs.{settings.max_wallet_credit_amount}"}
+                    else:
+                        with (tracer.start_as_current_span(f"tool:{tool_name}") if tracer else nullcontext()) as tool_span:
                             if tool_span:
-                                tool_span.set_attribute("tool.status", "success")
-                        except Exception as exc:
-                            tool_output = {"error": str(exc)}
-                            tool_results.append({"tool": tool_name, "args": tool_args, "error": str(exc)})
-                            if tool_span:
-                                tool_span.set_attribute("tool.status", "error")
+                                tool_span.set_attribute("openinference.span.kind", "TOOL")
+                                tool_span.set_attribute("tool.name", tool_name)
+                            try:
+                                tool_output = await mcp_client.call_tool(tool_name, tool_args)
+                                if tool_span:
+                                    tool_span.set_attribute("tool.status", "success")
+                            except Exception as exc:
+                                tool_output = {"error": str(exc)}
+                                if tool_span:
+                                    tool_span.set_attribute("tool.status", "error")
 
+                    tool_results.append({"tool": tool_name, "args": tool_args, "result": tool_output})
                     messages.append({"role": "assistant", "content": json.dumps(result)})
                     messages.append({"role": "user", "content": f"Tool result: {json.dumps(tool_output)}"})
 
-            # ── Fallback: force final answer ────────────────────
             messages.append({"role": "user", "content": "Please give a final answer to the customer now."})
             raw = await resolver_lm.acall(messages=messages)
             raw_text = raw[0] if isinstance(raw, list) else raw
@@ -259,27 +268,42 @@ Recent orders: {json.dumps(orders[:3]) if orders else 'None'}"""},
 
 
 # ═══════════════════════════════════════════════════════════════════
-# 4. HUMAN ESCALATE (no LLM)
+# 4. HUMAN ESCALATE
 # ═══════════════════════════════════════════════════════════════════
+TEAM_ROUTING = {
+    "wrong_item_delivered": "order_fulfillment",
+    "damaged_product": "service_center",
+    "late_delivery": "logistics",
+    "refund_status": "payments",
+    "cancellation_request": "order_fulfillment",
+    "return_request": "order_fulfillment",
+    "warranty_claim": "service_center",
+    "payment_issue": "payments",
+    "account_issue": "senior_support",
+    "general_inquiry": "general_support",
+    "complaint": "senior_support",
+}
+
+
 async def human_escalate(
     state: AgentState,
-    mcp_client: Any,
-    tracer: Any = None,
+    runtime: Runtime[Context],
 ) -> dict[str, Any]:
-    """Create a ticket and escalate to a human agent."""
+    """Create a ticket, escalate, and route to the correct team."""
+
+    mcp_client = runtime.context.mcp_client
+    tracer = runtime.context.tracer
 
     async def _run():
         classification = state.get("classification", {})
         customer_ctx = state.get("customer_context") or {}
         customer = customer_ctx.get("customer") or {}
         urgency = classification.get("urgency", 5)
+        intent = classification.get("intent", "general_inquiry")
 
-        if urgency >= 9:
-            priority, sla = "critical", "2 hours"
-        elif urgency >= 7:
-            priority, sla = "high", "4 hours"
-        else:
-            priority, sla = "medium", "24 hours"
+        priority = "critical" if urgency >= 9 else "high" if urgency >= 7 else "medium"
+        sla = "2 hours" if urgency >= 9 else "4 hours" if urgency >= 7 else "24 hours"
+        team = TEAM_ROUTING.get(intent, "general_support")
 
         with (tracer.start_as_current_span("human_escalate") if tracer else nullcontext()) as span:
             if span:
@@ -291,18 +315,21 @@ async def human_escalate(
                     "query_text": state["query_text"],
                     "classification": classification,
                     "priority": priority,
+                    "assigned_team": team,
                 })
                 await mcp_client.call_tool("escalate_to_human", {"ticket_id": ticket_id})
+                await mcp_client.call_tool("route_to_team", {"ticket_id": ticket_id, "team": team})
                 if span:
                     span.set_attribute("ticket.id", ticket_id)
                     span.set_attribute("ticket.priority", priority)
+                    span.set_attribute("ticket.team", team)
             except Exception:
                 log.exception("Failed to create/escalate ticket")
                 ticket_id = "unknown"
 
         response = (
             f"{customer.get('full_name', 'Hello')}, your issue has been flagged as "
-            f"{priority} priority. A senior agent will review your case within {sla}. "
+            f"{priority} priority. A {team.replace('_', ' ')} specialist will review your case within {sla}. "
             f"Your reference number is {ticket_id}."
         )
         return {

@@ -1,19 +1,13 @@
 """
 OpenTelemetry + OpenInference setup for the Agent Service.
 
-Architecture:
-  1. LOGS   — set up at module import time (before uvicorn).
-  2. TRACES — TracerProvider registered before framework imports.
-  3. METRICS — exactly 3 instruments per non-leaf service.
-  4. OpenInference — labels spans as AGENT, LLM, TOOL, GUARDRAIL, CHAIN.
-
 Invariants enforced:
-  - #1:  Log bridge at module import time
-  - #2:  TracerProvider before LangChain/FastAPI imports
-  - #6:  Exactly 3 metric instruments
-  - #7:  No sampling in application code
-  - #9:  Force-flush on shutdown
-  - #10: Root logger never set to WARNING
+  1. Log bridge at module import time
+  2. TracerProvider before framework imports
+  6. Exactly 3 metric instruments (agent.requests, agent.duration, agent.errors)
+  7. No sampling in application code
+  9. Force-flush on shutdown
+ 10. Root logger never set to WARNING
 """
 
 from __future__ import annotations
@@ -25,10 +19,7 @@ from typing import Any
 log = logging.getLogger("agent-service")
 
 
-# ═══════════════════════════════════════════════════════════════════
-# SAFE FALLBACKS
-# ═══════════════════════════════════════════════════════════════════
-
+# ── Safe fallbacks ────────────────────────────────────────────────
 class _NoOp:
     def add(self, *args: Any, **kwargs: Any) -> None: pass
     def record(self, *args: Any, **kwargs: Any) -> None: pass
@@ -51,12 +42,10 @@ _logger_provider: Any = None
 
 
 # ═══════════════════════════════════════════════════════════════════
-# 1. LOGS — MUST run at module import time (before uvicorn)
+# 1. LOGS – at module import time (before uvicorn)
 # ═══════════════════════════════════════════════════════════════════
-
 def _init_logging() -> None:
     global _logger_provider
-
     from opentelemetry import _logs
     from opentelemetry.exporter.otlp.proto.grpc._log_exporter import OTLPLogExporter
     from opentelemetry.instrumentation.logging import LoggingInstrumentor
@@ -64,10 +53,8 @@ def _init_logging() -> None:
     from opentelemetry.sdk._logs.export import BatchLogRecordProcessor
     from opentelemetry.sdk.resources import Resource
 
-    endpoint = os.getenv(
-        "OTEL_EXPORTER_OTLP_ENDPOINT",
-        "http://signoz-otel-collector.signoz.svc.cluster.local:4317",
-    )
+    endpoint = os.getenv("OTEL_EXPORTER_OTLP_ENDPOINT",
+                         "http://signoz-otel-collector.signoz.svc.cluster.local:4317")
     service_name = os.getenv("OTEL_SERVICE_NAME", "agent-service")
 
     resource = Resource.create({
@@ -85,15 +72,14 @@ def _init_logging() -> None:
     handler = LoggingHandler(level=logging.NOTSET, logger_provider=_logger_provider)
     logging.getLogger().addHandler(handler)
     LoggingInstrumentor().instrument(set_logging_format=False)
-    log.info("OTel logs bridge initialised — endpoint=%s", endpoint)
+    log.info("OTel logs bridge initialised – endpoint=%s", endpoint)
 
 _init_logging()
 
 
 # ═══════════════════════════════════════════════════════════════════
-# 2. TRACES + METRICS + OpenInference — call BEFORE importing LangChain/FastAPI
+# 2. TRACES + METRICS + OpenInference – before LangChain/FastAPI
 # ═══════════════════════════════════════════════════════════════════
-
 def init_otel() -> None:
     global _tracer_provider, _meter_provider, tracer
 
@@ -109,10 +95,8 @@ def init_otel() -> None:
     from opentelemetry.sdk.trace import TracerProvider
     from opentelemetry.sdk.trace.export import BatchSpanProcessor
 
-    endpoint = os.getenv(
-        "OTEL_EXPORTER_OTLP_ENDPOINT",
-        "http://signoz-otel-collector.signoz.svc.cluster.local:4317",
-    )
+    endpoint = os.getenv("OTEL_EXPORTER_OTLP_ENDPOINT",
+                         "http://signoz-otel-collector.signoz.svc.cluster.local:4317")
     insecure = os.getenv("OTEL_EXPORTER_OTLP_INSECURE", "true").lower() == "true"
     service_name = os.getenv("OTEL_SERVICE_NAME", "agent-service")
 
@@ -122,7 +106,7 @@ def init_otel() -> None:
         "deployment.environment": os.getenv("DEPLOYMENT_ENVIRONMENT", "production"),
     })
 
-    # ── Traces ───────────────────────────────────────────────────
+    # Traces
     try:
         _tracer_provider = TracerProvider(resource=resource)
         _tracer_provider.add_span_processor(
@@ -130,11 +114,11 @@ def init_otel() -> None:
         )
         trace.set_tracer_provider(_tracer_provider)
         tracer = trace.get_tracer(__name__)
-        log.info("OTel traces initialised — endpoint=%s", endpoint)
+        log.info("OTel traces initialised – endpoint=%s", endpoint)
     except Exception:
         log.exception("OTel traces initialisation failed")
 
-    # ── Metrics (exactly 3 instruments: invariant #6) ────────────
+    # Metrics
     try:
         export_interval = int(os.getenv("OTEL_METRIC_EXPORT_INTERVAL_MS", "60000"))
         export_timeout = int(os.getenv("OTEL_METRIC_EXPORT_TIMEOUT_MS", "30000"))
@@ -153,23 +137,19 @@ def init_otel() -> None:
         meter = metrics.get_meter(__name__)
 
         metrics_.request_counter = meter.create_counter(
-            "agent.requests", "1", "Total agent invocations"
-        )
+            "agent.requests", "1", "Total agent invocations")
         metrics_.request_duration = meter.create_histogram(
-            "agent.duration", "s", "Agent invocation latency"
-        )
+            "agent.duration", "s", "Agent invocation latency")
         metrics_.error_counter = meter.create_counter(
-            "agent.errors", "1", "Total agent errors"
-        )
-        log.info("OTel metrics initialised — interval=%sms", export_interval)
+            "agent.errors", "1", "Total agent errors")
+        log.info("OTel metrics initialised – interval=%sms", export_interval)
     except Exception:
         log.exception("OTel metrics initialisation failed")
 
-    # ── OpenInference instrumentors ──────────────────────────────
+    # OpenInference
     try:
         from openinference.instrumentation.langchain import LangChainInstrumentor
         from openinference.instrumentation.dspy import DSPyInstrumentor
-
         LangChainInstrumentor().instrument(tracer_provider=_tracer_provider)
         DSPyInstrumentor().instrument(tracer_provider=_tracer_provider)
         log.info("OpenInference instrumentors registered")
@@ -178,12 +158,8 @@ def init_otel() -> None:
 
 
 def shutdown() -> None:
-    """Force-flush and shut down all providers (invariant #9)."""
-    for name, p in [
-        ("traces", _tracer_provider),
-        ("metrics", _meter_provider),
-        ("logs", _logger_provider),
-    ]:
+    """Force-flush and shut down all providers."""
+    for name, p in [("traces", _tracer_provider), ("metrics", _meter_provider), ("logs", _logger_provider)]:
         if p is None:
             continue
         try:
